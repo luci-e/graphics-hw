@@ -1,4 +1,7 @@
-# Ignore all...
+# Ignore everything
 *
+**/*
 
-# But raytrace
+!/hw1/out/src/raytrace.cpp
+
+!.gitignore
