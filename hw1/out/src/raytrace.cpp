@@ -67,7 +67,7 @@ ybvh::scene* make_bvh(yobj::scene* scn) {
 }
 
 // Take a ray and a camera, get the pixels
-ym::vec2f reverse_eval(const yobj::camera* cam, const ym::ray3f ray) {
+/*ym::vec2f reverse_eval(const yobj::camera* cam, const ym::ray3f ray) {
 	auto coeff = ym::inverse(cam->xform()) * ym::vec4f(ray.d, 0.f);
 
 	print_vector(coeff, "Reverse coefficients: ", 4);
@@ -76,18 +76,16 @@ ym::vec2f reverse_eval(const yobj::camera* cam, const ym::ray3f ray) {
 	auto width = height * cam->aspect;
 
 	auto compared_ray = eval_camera(cam, ym::vec2f{ coeff[0] / width + 0.5f, coeff[1] / height + 0.5f });
-}
+}*/
 
 ym::ray3f eval_camera(const yobj::camera* cam, const ym::vec2f& uv) {
 	auto height = 2 * ym::tan(cam->yfov / 2);
 	auto width = height * cam->aspect;
 
 	// Values of the coefficients of the ray but we can save 3 assignments!
-	float a = ((uv[0] - 0.5f) * width);
-	float b = ((uv[1] - 0.5f) * height);
-	float c = -1.f;
-
-	std::cout << "I'm using coefficients: " << a << " " << b << " " << c << std::endl;
+	// float a = ((uv[0] - 0.5f) * width);
+	// float b = ((uv[1] - 0.5f) * height);
+	// float c = -1.f;
 
 	ym::frame3f frame = ym::to_frame(cam->xform());
 	ym::vec4f q = cam->xform() * ym::vec4f{ ((uv[0] - 0.5f) * width), ((uv[1] - 0.5f) * height), -1, 1 };
@@ -95,6 +93,7 @@ ym::ray3f eval_camera(const yobj::camera* cam, const ym::vec2f& uv) {
 	return ym::ray3f(frame.o, ym::normalize(ym::vec3f{ q[0], q[1], q[2] } - frame.o));
 }
 
+// Hold the coordinates of a texture pixel and a weight attached to it
 struct neighbour_pixel {
 	ym::vec2i px_coords;
 	float weight;
@@ -409,15 +408,7 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 
 		// Compute the vector from point to eye
 		auto eye_vector = ym::normalize(ray.o - point);
-
-		//TODO: FIXO
-		// ---------------------------------------------------------------------------------------------------- //
-		// Hic sunt tests //
-
-
-
-		// ---------------------------------------------------------------------------------------------------- //
-
+		
 		for (auto light : lights) {
 			auto light_shape = light->msh->shapes[0];
 			auto light_mat = light_shape->mat;
@@ -439,7 +430,7 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 
 
 					if (shape->lines.size() == 0) {
-						// Mary had a little Lambert 
+						// Mary had a little Lambert, little Lambert, little Lambert...
 						//colour += (ym::vec3f{1.f, 1.f, 1.f} - kr) * kd * light_intensity * ym::max(0.0f, ym::dot(normal, light_direction));
 						colour += kd * light_intensity * ym::max(0.0f, ym::dot(normal, light_direction));
 
@@ -511,8 +502,6 @@ ym::vec4f get_instance_colour(int iid) {
 
 	return colour;
 }
-
-
 
 ym::image4f raytrace(const yobj::scene* scn, const ybvh::scene* bvh,
     const ym::vec3f& amb, int resolution, int samples, int cam_no = 0, bool coloured_light = true) {
