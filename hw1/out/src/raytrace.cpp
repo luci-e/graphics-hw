@@ -5,15 +5,12 @@
 #include "yocto_math.h"
 #include "yocto_obj.h"
 #include "yocto_utils.h"
+#include <math.h>
 #include <omp.h>
+#include "embree2\rtcore.h"
+#include "embree2\rtcore_ray.h"
 
 #define MAX_BOUNCES 1
-
-/** The square root of 2.   */
-#define M_SQRT2     1.41421356237309504880f  /* sqrt(2) */
-/** The constant \a 1/sqrt(2).  */
-#define M_SQRT1_2   0.70710678f  /* 1/sqrt(2) */
-
 
 template <typename T>
 const void print_vector(T vector, std::string prefix, int size) {
@@ -93,6 +90,14 @@ ym::ray3f eval_camera(const yobj::camera* cam, const ym::vec2f& uv) {
 	return ym::ray3f(frame.o, ym::normalize(ym::vec3f{ q[0], q[1], q[2] } - frame.o));
 }
 
+
+
+
+
+// ---------------------------------------------------------------------------------------------------- //
+// Should I manually copy and paste from the slides, possibly introducing errors or just use a pre-made
+// function that I know works ? To be fair though, a different interpolation algorithm is provided
+
 // Hold the coordinates of a texture pixel and a weight attached to it
 struct neighbour_pixel {
 	ym::vec2i px_coords;
@@ -108,62 +113,117 @@ float round_and_snap(float x) {
 
 void closest_neighbours_pixel(neighbour_pixel * neighbours, ym::vec2f st, int width, int height) {
 	ym::vec2f n;
-	ym::vec2f snaps = { round_and_snap(st.x), round_and_snap(st.y) }; 
-	ym::vec2f center = { (int)st.x + 0.5f, (int)st.y + 0.5f };
+	ym::vec2f snaps = { round_and_snap(st.x), round_and_snap(st.y) };
+	ym::vec2f center = { ym::floor(st.x) + 0.5f, ym::floor(st.y) + 0.5f };
 
-	n = snaps;
-	neighbours[0] = { { ((int)n.x) % width, (height -1) - (((int) n.y) % height)}, 1.f / ym::length(n - st) };
+	ym::vec2f oovec = { 1.f, 1.f };
+	ym::vec2f weight;
 
-	n = { snaps.x, center.y };
-	neighbours[1] = { { ((int)n.x) % width, (height - 1) - (((int)n.y) % height) }, 1.f / ym::length(n - st) };
-
-	n = { center.x, snaps.y };
-	neighbours[2] = { { ((int)n.x) % width, (height - 1) - (((int)n.y) % height) }, 1.f / ym::length(n - st) };
-
-	n = { center.x, center.y };
-	neighbours[3] = { { ((int)n.x) % width, (height - 1) - (((int)n.y) % height) },1.f / ym::length(n - st) };
+	unsigned int i = 0;
+	for (auto n : { snaps, ym::vec2f{ snaps.x, center.y }, ym::vec2f{ center.x, snaps.y }, ym::vec2f{ center.x, center.y } }) {
+		weight = oovec - ym::abs((n - st));
+		neighbours[i++] = { { ((int)n.x) % width, (height - 1) - (((int)n.y) % height) }, weight[0] * weight[1] };
+	}
 }
 
-ym::vec4f eval_texture( const yobj::texture* txt, const ym::vec2f& texcoord, bool srgb = true) {
-	const ym::image4f * _hdr; 
-	const ym::image4b * _ldr;	
+ym::vec4f eval_texture(const yobj::texture* txt, const ym::vec2f& texcoord, bool srgb = true) {
+	const ym::image4f * _hdr;
+	const ym::image4b * _ldr;
 	bool _set;
 
-	int width, height;
+	float width, height;
 	neighbour_pixel closest_neighbours[4];
 
-	if (txt->hdr) { _hdr = (&txt->hdr); _set = false; } else { _ldr = (&txt->ldr); _set = true; }
-	if (_set) { width = _ldr->width(); } else { width = _hdr->width(); }
-	if (_set) { height = _ldr->height(); } else { height = _hdr->height(); }
+	// And here's where I'd put my texture...
+	if (!txt) {
+		// ... IF I HAD ONE!
+		return { 1.f, 1.f, 1.f, 1.f };
+	}
 
-	auto s = std::fmod(texcoord.x, 1.f) * ((float) width);
-	auto t = std::fmod(texcoord.y, 1.f) * ((float) height);
+	if (txt->hdr) { _hdr = (&txt->hdr); _set = false; }
+	else { _ldr = (&txt->ldr); _set = true; }
+	width = txt->width(); height = txt->height();
+
+	auto s = std::fmod(texcoord.x, 1.f) * width;
+	auto t = std::fmod(texcoord.y, 1.f) * height;
+
+	// Apparently texcoord can be < 0
+	if (s < 0) { s += width; }
+	if (t < 0) { t += height; }
 
 	closest_neighbours_pixel(closest_neighbours, { s,t }, width, height);
-
-	float sum = 0;
 	ym::vec4f pixel;
+
 	if (_set) {
 		for (int i = 0; i < 4; i++) {
 			auto n = closest_neighbours[i];
-			pixel += ym::byte_to_float((*_ldr)[n.px_coords])*n.weight;
-			//print_vector(pixel, "pixel ", 4);
-			sum += n.weight;
+			auto px = (*_ldr)[n.px_coords];
+			// Bring back to linear if srgb otherwise just convert to float value
+			(srgb) ? pixel += ym::srgb_to_linear(px)*n.weight : pixel += ym::byte_to_float(px)*n.weight;
 		}
-	} else {
+	}
+	else {
 		for (int i = 0; i < 4; i++) {
 			auto n = closest_neighbours[i];
-			pixel = (*_hdr)[n.px_coords]*n.weight;
-			//print_vector(pixel, "pixel ", 4);
-			sum += n.weight;
+			auto px = (*_hdr)[n.px_coords];
+			pixel += px*n.weight;
 		}
 	}
-	
-	if (_set) { return ym::pow(pixel/sum, 2.2f); }
+	return pixel;
+}
+
+// It's got asserts, it's what functions crave.
+inline ym::vec4f lookup_texture( const yobj::texture* txt, const ym::vec2i& ij, bool srgb = true) {
+	if (txt->ldr) {
+		auto v = txt->ldr[{ij.x, ij.y}];
+		return (srgb) ? ym::srgb_to_linear(v) : ym::byte_to_float(v);
+	}
+	else if (txt->hdr) {
+		return txt->hdr[{ij.x, ij.y}];
+	}
 	else {
-		return pixel / sum;
+		assert(false);
+		return {};
 	}
 }
+
+ym::vec4f eval_texture_2(	const yobj::texture* txt, const ym::vec2f& texcoord, bool srgb = true) {
+	// And here's where I'd put my texture...
+	if (!txt) {
+		// ... IF I HAD ONE!
+		return { 1.f, 1.f, 1.f, 1.f };
+	}
+
+	auto wh = ym::vec2i{ txt->width(), txt->height() };
+
+	// get coordinates normalized for tiling
+	auto st = ym::vec2f{
+	std::fmod(texcoord.x, 1.0f) * wh.x, std::fmod(texcoord.y, 1.0f) * wh.y };
+
+	// wtf, texture coordinates can have negative values ???
+	if (st.x < 0) st.x += wh.x;
+	if (st.y < 0) st.y += wh.y;
+
+	// get image coordinates and residuals
+	auto ij = ym::clamp(ym::vec2i{ (int)st.x, (int)st.y }, { 0, 0 }, wh);
+	auto uv = st - ym::vec2f{ (float)ij.x, (float)ij.y };
+
+	// When you're programming in C++ but tuples are life
+	// get interpolation weights and indices
+	ym::vec2i idx[4] = { ij,{ ij.x, (ij.y + 1) % wh.y },
+	{ (ij.x + 1) % wh.x, ij.y },{ (ij.x + 1) % wh.x, (ij.y + 1) % wh.y } };
+	auto w = ym::vec4f{ (1 - uv.x) * (1 - uv.y), (1 - uv.x) * uv.y,
+		uv.x * (1 - uv.y), uv.x * uv.y };
+
+	// handle interpolation
+	return (lookup_texture(txt, idx[0], srgb) * w.x +
+			lookup_texture(txt, idx[1], srgb) * w.y +
+			lookup_texture(txt, idx[2], srgb) * w.z +
+			lookup_texture(txt, idx[3], srgb) * w.w);
+}
+
+// ---------------------------------------------------------------------------------------------------- //
+
 
 // Use this one for 3-dimensional vectors
 ym::vec3f barycentric_to_vec(ym::vec4f bar_coord, std::vector<ym::vec3f> vecs, int vec_no) {
@@ -171,7 +231,6 @@ ym::vec3f barycentric_to_vec(ym::vec4f bar_coord, std::vector<ym::vec3f> vecs, i
 	for (int i = 0; i < vec_no; i++) {
 		vec += bar_coord[i] * vecs[i];
 	}
-
 	return vec;
 }
 
@@ -211,7 +270,7 @@ float opaqueness_at_intersection(const yobj::scene* scn, const ybvh::scene* bvh,
 			texture_coords = barycentric_to_vec(intersection.euv, textures, 3);
 		}
 
-		op *= eval_texture(mat->op_txt, texture_coords)[0];
+		op *= eval_texture(mat->op_txt, texture_coords, false)[0];
 	}
 
 	return op;
@@ -257,7 +316,7 @@ point_info get_point_info(const yobj::scene* scn, const ybvh::intersection_point
 
 		// Goodbye simmetry hello efficiency
 		if (is_textured) {
-			std::vector<ym::vec2f> textures = { shape->texcoord[t[0]], shape->texcoord[t[1]], shape->texcoord[t[2]], };
+			std::vector<ym::vec2f> textures = { shape->texcoord[t[0]], shape->texcoord[t[1]], shape->texcoord[t[2]] };
 			p_i.texture_coords = barycentric_to_vec(intersection.euv, textures, 3);
 		}
 
@@ -298,7 +357,7 @@ ym::vec4f shade_light(const yobj::scene* scn, const ybvh::scene* bvh, const yobj
 				auto light_hit_point = light_hit_point_i.point;
 
 				if (is_textured) {
-					auto kd_4 = eval_texture(mat->kd_txt, light_hit_point_i.texture_coords);
+					auto kd_4 = eval_texture(mat->kd_txt, light_hit_point_i.texture_coords, true);
 					kd *= { kd_4[0], kd_4[1], kd_4[2] };
 				}
 
@@ -373,29 +432,29 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 
 		// Compute the texture_coords value
 		if (is_textured) {
+			if (mat->op_txt) {
+				auto op_4 = eval_texture(mat->op_txt, texture_coords, false);
+				op *= op_4[0];
+			}
+
 			if (mat->ks_txt) {
-				auto ks_4 = eval_texture(mat->ks_txt, texture_coords);
-				ks *= { ks_4[0], ks_4[1], ks_4[2] };
+				auto ks_4 = eval_texture(mat->ks_txt, texture_coords, true);
+				ks *= ym::vec3f{ ks_4[0], ks_4[1], ks_4[2] };
 			}
 
 			if (mat->kd_txt) {
-				auto kd_4 = eval_texture(mat->kd_txt, texture_coords);
-				kd *= { kd_4[0], kd_4[1], kd_4[2] };
+				auto kd_4 = eval_texture(mat->kd_txt, texture_coords, true);
+				kd *= ym::vec3f{ kd_4[0], kd_4[1], kd_4[2] };
 			}
 
 			if (mat->kr_txt) {
-				auto kr_4 = eval_texture(mat->kr_txt, texture_coords);
-				kr *= { kr_4[0], kr_4[1], kr_4[2] };
+				auto kr_4 = eval_texture(mat->kr_txt, texture_coords, false);
+				kr *= { kr_4[0], kr_4[1], kr_4[2]};
 			}
 
 			if (mat->rs_txt) {
-				auto rs_4 = eval_texture(mat->rs_txt, texture_coords);
+				auto rs_4 = eval_texture(mat->rs_txt, texture_coords, false);
 				rs *= rs_4[0];
-			}
-
-			if (mat->op_txt) {
-				auto op_4 = eval_texture(mat->op_txt, texture_coords);
-				op *= op_4[0];
 			}
 		}
 
@@ -407,7 +466,13 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 		normal = ym::transform_direction(instance->xform(), normal);
 
 		// Compute the vector from point to eye
-		auto eye_vector = ym::normalize(ray.o - point);
+		//auto eye_vector = ym::normalize(ray.o - point);
+		auto eye_vector = ym::normalize(-ray.d);
+
+		float bp_exponent;
+		if (is_specular && !is_reflective) {
+			bp_exponent = (rs > 0.f) ? 2.f / (rs * rs) - 2.f : 1e6f;
+		}
 		
 		for (auto light : lights) {
 			auto light_shape = light->msh->shapes[0];
@@ -424,14 +489,12 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 
 				auto shaded_light = shade_light(scn, bvh, light, light_point, ym::ray3f(point, light_direction, 1e-6f, light_distance), coloured_light);
 
-				// If we intersect a light it's ok, keep going!
 				if (shaded_light[3] != 1.f) {
 					auto light_intensity = ym::vec3f{ shaded_light[0], shaded_light[1], shaded_light[2] } / (light_distance * light_distance);
 
 
 					if (shape->lines.size() == 0) {
 						// Mary had a little Lambert, little Lambert, little Lambert...
-						//colour += (ym::vec3f{1.f, 1.f, 1.f} - kr) * kd * light_intensity * ym::max(0.0f, ym::dot(normal, light_direction));
 						colour += kd * light_intensity * ym::max(0.0f, ym::dot(normal, light_direction));
 
 						// ---------------------------------------------------------------------------------------------------- //
@@ -440,7 +503,6 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 						if (is_specular && !is_reflective) {
 							auto eye_plus_light = eye_vector + light_direction;
 							auto bisector = ym::normalize(eye_plus_light);
-							auto bp_exponent = (rs > 0.f) ? 2.f / (rs * rs) - 2.f : 1e6f;
 
 							colour += ks * light_intensity * ym::pow(ym::max(0.0f, ym::dot(normal, bisector)), bp_exponent);
 						}
@@ -449,9 +511,8 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 						// Déjà vu, much?
 						auto eye_plus_light = eye_vector + light_direction;
 						auto bisector = ym::normalize(eye_plus_light);
-						auto bp_exponent = (rs > 0.f) ? 2.f / (rs * rs) - 2.f : 1e6f;
 
-						colour += kd * light_intensity * ym::sqrt(1 - ym::abs(ym::dot(normal, light_direction))) + ks *  ym::pow(ym::sqrt(1 - ym::abs(ym::dot(normal, bisector))), bp_exponent);
+						colour += kd * light_intensity * ym::sqrt(1 - ym::abs(ym::dot(normal, light_direction))) + ks * light_intensity *  ym::pow(ym::sqrt(1 - ym::abs(ym::dot(normal, bisector))), bp_exponent);
 					}
 
 				}
@@ -470,12 +531,14 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 			}
 		}
 
-		colour += amb;
+		// Since ambient light comes from all directions we can assume there is at least 1 ray of ambient light perfectly
+		// specular to our surface. We can thus sum it to the colour
+		colour += kd * amb;
 		ym::vec4f full_colour = { colour[0], colour[1], colour[2], 1.f };
 
 		// You-u-uh see right through me
 		if (op < 1) {
-			full_colour = op*full_colour + (1 - op)*shade(scn, bvh, lights, amb, ym::ray3f(point, ray.d, 1e-6f));
+			full_colour = op*full_colour + (1 - op)*shade(scn, bvh, lights, amb, ym::ray3f(point, ray.d, 1e-6f), ray_depth, coloured_light);
 		}
 
 		return full_colour;
@@ -483,24 +546,6 @@ ym::vec4f shade(const yobj::scene* scn, const ybvh::scene* bvh,
 
 	// Eh, maybe?
     return {};
-}
-
-ym::vec4f get_instance_colour(int iid) {
-	static int i = 0;
-	static std::map<int, ym::vec4f> instances_colours;
-	static ym::vec4f colours[] = { { 255, 0, 0, 1 },{ 0, 255, 0, 1 },{ 0, 0, 255, 1 },{ 42, 42, 42, 1 } };
-
-	ym::vec4f colour;
-
-	try {
-		colour = instances_colours.at(iid);
-	}
-	catch (std::exception e) {
-		colour = colours[i++ % 4];
-		instances_colours[iid] = colour;
-	}
-
-	return colour;
 }
 
 ym::image4f raytrace(const yobj::scene* scn, const ybvh::scene* bvh,
@@ -652,6 +697,8 @@ int main(int argc, char** argv) {
     // command line parsing
     auto parser =
         yu::cmdline::make_parser(argc, argv, "raytrace", "raytrace scene");
+	auto yocto = yu::cmdline::parse_flag(
+		parser, "--yocto", "-y", "yocto gl", false);
     auto parallel =
         yu::cmdline::parse_flag(parser, "--parallel", "-p", "runs in parallel");
     auto resolution = yu::cmdline::parse_opti(
@@ -670,27 +717,100 @@ int main(int argc, char** argv) {
         parser, "scenein", "input scene", "scene.obj", true);
     yu::cmdline::check_parser(parser);
 
-    // load scene
-    yu::logging::log_info("loading scene " + scenein);
-    auto scn = yobj::load_scene(scenein, true);
-    // add missing data
-    yobj::add_normals(scn);
-    yobj::add_radius(scn, 0.001f);
-    yobj::add_instances(scn);
-    yobj::add_default_camera(scn);
+	// load scene
+	yu::logging::log_info("loading scene " + scenein);
+	auto scn = yobj::load_scene(scenein, true);
+	// add missing data
+	yobj::add_normals(scn);
+	yobj::add_radius(scn, 0.001f);
+	yobj::add_instances(scn);
+	yobj::add_default_camera(scn);
 
-    // create bvh
-    yu::logging::log_info("creating bvh");
-    auto bvh = make_bvh(scn);
-    // raytrace
-    yu::logging::log_info("tracing scene");
-    auto hdr = (parallel)
-                   ? raytrace_mt(scn, bvh, {amb, amb, amb}, resolution, samples, cam_no, coloured_light)
-                   : raytrace(scn, bvh, {amb, amb, amb}, resolution, samples, cam_no, coloured_light);
-    // tonemap and save
-    yu::logging::log_info("saving image " + imageout);
-    auto ldr = ym::tonemap_image(hdr, ym::tonemap_type::srgb, 0, 2.2);
-    yimg::save_image4b(imageout, ldr);
+	if (yocto) {
+		yu::logging::log_info("Started yocto");
 
+		// create bvh
+		yu::logging::log_info("creating bvh");
+		auto bvh = make_bvh(scn);
+		// raytrace
+		yu::logging::log_info("tracing scene");
+		auto hdr = (parallel)
+			? raytrace_mt(scn, bvh, { amb, amb, amb }, resolution, samples, cam_no, coloured_light)
+			: raytrace(scn, bvh, { amb, amb, amb }, resolution, samples, cam_no, coloured_light);
+		// tonemap and save
+		yu::logging::log_info("saving image " + imageout);
+		auto ldr = ym::tonemap_image(hdr, ym::tonemap_type::srgb, 0, 2.2);
+		yimg::save_image4b(imageout, ldr);
+	}
+	else {
+		yu::logging::log_info("Started embree");
+		auto device = rtcNewDevice(NULL);
+		auto scene = rtcDeviceNewScene(device, RTC_SCENE_STATIC, RTC_INTERSECT1);
+
+
+
+		rtcDeleteScene(scene);
+		rtcDeleteDevice(device);
+	}
 	//system("PAUSE");
+}
+
+
+namespace yobree {
+	struct vertex { float x, y, z, a; };
+	struct triangle { int v0, v1, v2; };
+
+	void import_yocto_meshes(yobj::scene * scn, RTCScene & rtcscn) {
+		for (auto msh : scn->meshes) {
+			std::map<std::string, std::vector<int>> mesh_ids;
+			unsigned int id;
+
+			for each(auto mesh in scn->meshes) {
+				for each(auto shape in mesh->shapes) {
+					auto positions = shape->pos;
+					auto vertex_no = positions.size();
+					auto radiuses = shape->radius;
+
+					// Determine the type of shape
+/*					if (shape->points.size() != 0) {
+						id = 
+					}
+					else if (shape->lines.size() != 0) {
+						id = 
+					}
+					else */if (auto triangles_size = shape->triangles.size() != 0) {
+						id = rtcNewTriangleMesh2(rtcscn, RTC_GEOMETRY_STATIC, triangles_size, vertex_no, 1);
+						auto vertices = (vertex*) rtcMapBuffer(rtcscn, id, RTC_VERTEX_BUFFER);
+						auto triangles = (triangle*) rtcMapBuffer(rtcscn, id, RTC_INDEX_BUFFER);
+
+						for (int v = 0; v < vertex_no; v++) {
+							auto &ver = vertices[v];
+							auto &cver = positions[v];
+							ver.x = cver.x;
+							ver.y = cver.y;
+							ver.z = cver.z;
+						}
+
+						for (int t = 0; t < triangles_size; t++) {
+							triangles[t].v0 = 
+						}
+
+						rtcUnmapBuffer(rtcscn, id, RTC_VERTEX_BUFFER);
+						rtcUnmapBuffer(rtcscn, id, RTC_INDEX_BUFFER);
+					}
+					//else if (shape->tetras.size() != 0) {
+					//	id = 
+					//}
+				}
+				// Add the shape id to the vector indexed by the mesh
+				mesh_ids[mesh->name].push_back(id);
+			}
+
+			for each (auto instance in scn->instances) {
+				auto frame = ym::to_frame(instance->xform());
+				auto mesh = instance->msh;
+			}
+
+		}
+	}
 }
