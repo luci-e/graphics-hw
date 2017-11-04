@@ -2,6 +2,9 @@
 *
 **/*
 
+!/hw1/out/src/raytrace.h
 !/hw1/out/src/raytrace.cpp
+!/hw1/out/src/yobree.h
+!/hw1/out/src/yobree.cpp
 
 !.gitignore
