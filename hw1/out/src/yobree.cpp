@@ -46,7 +46,7 @@ namespace yobree {
 			auto positions = shape->pos;
 			auto radii = shape->radius;
 			size_t vertex_no = positions.size();
-			auto &rtcscn = breec.bree_scenes.emplace_back(rtcDeviceNewScene(breec.bree_device, RTC_SCENE_STATIC, RTC_INTERSECT1));
+			auto rtcscn = breec.bree_scenes.emplace_back(rtcDeviceNewScene(breec.bree_device, RTC_SCENE_STATIC, RTC_INTERSECT1));
 
 			// Determine the type of shape
 			size_t points_size = shape->points.size();
@@ -70,14 +70,14 @@ namespace yobree {
 				}
 			}				
 			else if (lines_size!= 0) {
-				id = rtcNewLineSegments2(rtcscn, RTC_GEOMETRY_STATIC, lines_size, vertex_no, 0, mesh_no);
+				id = rtcNewLineSegments2(rtcscn, RTC_GEOMETRY_STATIC, 2*lines_size, vertex_no, 1, mesh_no);
 				auto lines = (line*) rtcMapBuffer(rtcscn, id, RTC_INDEX_BUFFER);
 				//auto err_no = rtcDeviceGetError(breec.bree_device);
 				//print_error("Wassup my lines", err_no);
 
 				for (size_t l = 0; l < lines_size; l++) {
 					lines[l].v0 = shape->lines[l].x;
-					//lines[l].v1 = shape->lines[l].y;
+					lines[l].v1 = shape->lines[l].y;
 				}
 			}
 			else if (triangles_size != 0) {
@@ -125,12 +125,12 @@ namespace yobree {
 			auto xform = instance->xform();
 			copy_matrix(mat, xform);
 
-			auto &scene = breec.bree_scenes[msh_scn[instance->msh->name]];
+			auto scene = breec.bree_scenes[msh_scn[instance->msh->name]];
 			id = rtcNewInstance3(breec.main_scene, scene, 1, instance_no);
-			rtcSetTransform2(breec.main_scene, id, RTC_MATRIX_COLUMN_MAJOR, (float *)(mat.matrix), 1);
+			rtcSetTransform2(breec.main_scene, id, RTC_MATRIX_ROW_MAJOR, (float *)(mat.matrix), 0);
 			rtcUpdate(breec.main_scene, id);
 		}
-
+			
 		rtcCommit(breec.main_scene);
 		
 	}
@@ -154,7 +154,18 @@ namespace yobree {
 	// Use this one for 3-dimensional vectors
 	ym::vec3f barycentric_to_vec(float u, float v, std::vector<ym::vec3f> vecs, int vec_no) {
 		ym::vec3f vec = { 0, 0, 0 };
-		ym::vec3f bar_coord = { 1 - u - v, u, v };
+		ym::vec3f bar_coord;
+		
+		if (vec_no == 1) {
+			bar_coord = { u, 0.f, 0.f };
+		}
+		else if (vec_no == 2) {
+			bar_coord = { u, v, 0.f };
+		}
+		else if (vec_no == 3) {
+			bar_coord = { 1 - u - v, u, v };
+		}
+
 		for (int i = 0; i < vec_no; i++) {
 			vec += bar_coord[i] * vecs[i];
 		}
@@ -164,7 +175,18 @@ namespace yobree {
 	// Use this one 2 dimensional vectors ( for textures )
 	ym::vec2f barycentric_to_vec(float u, float v, std::vector<ym::vec2f> vecs, int vec_no) {
 		ym::vec2f vec = { 0, 0 };
-		ym::vec3f bar_coord = { 1 - u - v, u, v };
+		ym::vec3f bar_coord;
+
+		if (vec_no == 1) {
+			bar_coord = { u, 0.f, 0.f };
+		}
+		else if (vec_no == 2) {
+			bar_coord = { u, v, 0.f };
+		}
+		else if (vec_no == 3) {
+			bar_coord = { 1 - u - v, u, v };
+		}
+
 		for (int i = 0; i < vec_no; i++) {
 			vec += bar_coord[i] * vecs[i];
 		}
@@ -244,7 +266,7 @@ namespace yobree {
 				texture_coords = shape->texcoord[p];
 			}
 			else if (shape->lines.size() != 0) {
-				auto l = shape->lines[intersection.primID];
+				auto l = shape->lines[intersection.primID/2];
 				std::vector<ym::vec2f> textures = { shape->texcoord[l[0]], shape->texcoord[l[1]] };
 				texture_coords = barycentric_to_vec(intersection.u, intersection.v, textures, 2);
 			}
@@ -274,7 +296,7 @@ namespace yobree {
 			}
 		}
 		else if (shape->lines.size() != 0) {
-			auto l = shape->lines[intersection.primID];
+			auto l = shape->lines[intersection.primID/2];
 			std::vector<ym::vec3f> vectors = { shape->pos[l[0]], shape->pos[l[1]] };
 			std::vector<ym::vec3f> normals = { shape->norm[l[0]], shape->norm[l[1]] };
 

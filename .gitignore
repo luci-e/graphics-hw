@@ -7,4 +7,9 @@
 !/hw1/out/src/yobree.h
 !/hw1/out/src/yobree.cpp
 
+!/hw2/out/src/raytrace.h
+!/hw2/out/src/raytrace.cpp
+!/hw2/out/src/yobree.h
+!/hw2/out/src/yobree.cpp
+
 !.gitignore

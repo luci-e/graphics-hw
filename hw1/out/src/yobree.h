@@ -41,6 +41,9 @@ namespace yobree {
 		ym::vec2f texture_coords;
 	};
 
+	void print_error(std::string prefix, RTCError err_no);
+
+
 	// ---------------------------------------------------------------------------------------------------- //
 	// Should I manually copy and paste from the slides, possibly introducing errors or just use a pre-made
 	// function that I know works ? To be fair though, a different interpolation algorithm is provided

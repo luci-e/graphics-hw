@@ -744,12 +744,10 @@ int main(int argc, char** argv) {
 		error_handler(nullptr, rtcDeviceGetError(breec.bree_device));
 
 		breec.main_scene = rtcDeviceNewScene(breec.bree_device, RTC_SCENE_STATIC, RTC_INTERSECT1);
-		yobree::import_yocto_meshes(scn, breec);
 
 		// raytrace
 		yu::logging::log_info("tracing scene");
 		yobree::import_yocto_meshes(scn, breec);
-
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 		auto hdr = yobree::bree_raytrace(breec, scn, { amb, amb, amb }, resolution, samples, cam_no, coloured_light);
