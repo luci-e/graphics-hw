@@ -249,13 +249,6 @@ void displace(yscn::shape* shp, float scale) {
 	} else { yu::logging::log_error("Can only displace quads or triangles!"); }
 }
 
-struct edge_adj {
-	ym::vec2i edge;
-	ym::vec2i adjs;
-	bool edge_case;
-};
-
-
 // Tessellate triangle mesh with Loop algorithm
 void tessellate_triangle_mesh(yscn::shape* shp) {
 	auto e_map = ym::edge_map{ shp->triangles };
@@ -272,7 +265,6 @@ void tessellate_triangle_mesh(yscn::shape* shp) {
 	// Expand the shape vectors to accomodate for the new points
 	shp->pos.resize(pos_no + edge_no);
 	shp->norm.resize(pos_no + edge_no);
-	shp->triangles.resize(4u*triangles_no);
 	if (txc_f) { shp->texcoord.resize(pos_no + edge_no); }
 	if (txc1_f) { shp->texcoord1.resize(pos_no + edge_no); }
 	if (clr_f) { shp->color.resize(pos_no + edge_no); }
@@ -330,10 +322,9 @@ void tessellate_quad_mesh(yscn::shape* shp) {
 	bool tgs_f = !shp->tangsp.empty();
 
 
-	// Expand the shape vectors to accomodate for the new points, we actually overshoot a bit 
+	// Expand the shape vectors to accomodate for the new points
 	shp->pos.resize(pos_no + edge_no + quads_no);
 	shp->norm.resize(pos_no + edge_no + quads_no);
-	shp->quads.resize(4u * quads_no);
 	if (txc_f) { shp->texcoord.resize(pos_no + edge_no + quads_no); }
 	if (txc1_f) { shp->texcoord1.resize(pos_no + edge_no + quads_no); }
 	if (clr_f) { shp->color.resize(pos_no + edge_no + quads_no); }
@@ -427,6 +418,46 @@ void tesselate(yscn::shape* shp, int level) {
 	yu::logging::log_error("Sorry mate, only triangles and quads\n");
 }
 
+
+void smooth_quad_mesh(yscn::shape *shp) {
+	auto original_mesh = shp->pos;
+	auto avg_v = std::vector < ym::vec3f > (shp->pos.size());
+	auto avg_n = std::vector<int>(shp->pos.size(), 0);
+
+	for (auto quad : shp->quads) {
+		// Get the points of the quad
+		auto v0 = quad.x;
+		auto v1 = quad.y;
+		auto v2 = quad.z;
+		auto v3 = quad.w;
+
+		auto c = QUAD_CENTROID(shp->pos[v0], shp->pos[v1], shp->pos[v2], shp->pos[v3]);
+
+		for (auto v : { v0, v1, v2, v3 }) {
+			avg_v[v] += c;
+			avg_n[v] += 1;
+		}
+	}
+
+	for (size_t v_index = 0; v_index < avg_n.size(); v_index++) {
+		avg_v[v_index] /= (float) avg_n[v_index];
+	}
+
+	for (size_t v_index = 0; v_index < avg_v.size(); v_index++) {
+		shp->pos[v_index] += (avg_v[v_index] - original_mesh[v_index]) * (4.f / (float) avg_n[v_index]);
+	}
+}
+
+void convert_triangles_to_quads(yscn::shape *shp) {
+	yu::logging::log_info("Converting triangles to quads for Catmull-Clark");
+	shp->quads.resize(shp->triangles.size());
+	for (size_t i = 0; i < shp->triangles.size(); i++) {
+		auto tri = shp->triangles[i];
+		shp->quads[i] = { tri.x, tri.y, tri.z, tri.z };
+	}
+	shp->triangles.clear();
+}
+
 //
 // Implement Catmull-Clark subdivision with the algorithm specified in class.
 // You should only handle quad meshes, but note that some quad might be
@@ -435,7 +466,14 @@ void tesselate(yscn::shape* shp, int level) {
 // At the end, smooth the normals with `ym::compute_normals()`.
 //
 void catmull_clark(yscn::shape* shp, int level) {
-    // YOUR CODE GOES HERE
+	int i = 0;
+	// Someone passed the wrong mesh
+	if (!shp->triangles.empty()) { convert_triangles_to_quads(shp); }
+	while (i++ < level) {
+		tesselate(shp, 1);
+		smooth_quad_mesh(shp);
+	}
+	ym::compute_normals(shp->quads, shp->pos, shp->norm);
 }
 
 //
@@ -449,7 +487,29 @@ void catmull_clark(yscn::shape* shp, int level) {
 yscn::shape* make_hair(
     const yscn::shape* shp, int nhair, float length, float radius) {
     auto hair = new yscn::shape();
-    // YOUR CODE GOES HERE
+
+	// Make space for the hairification
+	hair->lines.resize(nhair);
+
+	// Set one radius for all ( we can do better )
+	hair->radius.resize(2 * nhair);
+	std::fill_n(hair->radius.begin(), (2 * nhair), radius);
+
+	ym::sample_triangles_points(shp->triangles, shp->pos, shp->norm, shp->texcoord, nhair, hair->pos, hair->norm, hair->texcoord, 0u);
+
+	// Expand the vectors to double the number of hairs
+	hair->pos.resize(2 * nhair);
+	hair->norm.resize(2 * nhair);
+	hair->texcoord.resize(2 * nhair);
+
+	std::copy_n(hair->norm.begin(), nhair, hair->norm.begin() + nhair);
+	std::copy_n(hair->texcoord.begin(), nhair, hair->texcoord.begin() + nhair);
+
+	for (size_t i = 0; i < nhair; i++) {
+		hair->pos[i + nhair] = hair->pos[i] + hair->norm[i] * length;
+		hair->lines[i] = { (int) i, ((int) i ) + nhair };
+	}
+
     return hair;
 }
 
@@ -476,7 +536,44 @@ inline std::array<ym::vec3f, 4> make_rnd_curve(
 yscn::shape* make_curves(
     const yscn::shape* shp, int ncurve, int nsegs, float radius) {
     auto hair = new yscn::shape();
-    // YOUR CODE GOES HERE
+
+	// Make space for the hairification
+	hair->lines.reserve(nsegs * ncurve);
+
+	// Set one radius for all ( we can do better )
+	hair->radius.resize((nsegs + 1) * ncurve);
+	std::fill_n(hair->radius.begin(), (nsegs + 1) * ncurve, radius);
+
+	ym::sample_triangles_points(shp->triangles, shp->pos, shp->norm, shp->texcoord, ncurve, hair->pos, hair->norm, hair->texcoord, 0u);
+
+	// Expand the vectors to nsegs + 1 * the number of hairs
+	hair->pos.resize((nsegs + 1) * ncurve);
+	hair->norm.resize((nsegs + 1) * ncurve);
+	hair->texcoord.resize((nsegs + 1) * ncurve);
+
+	for (size_t i = 0; i < ncurve; i++) {
+		auto raw_curve = make_rnd_curve(hair->pos[i], hair->norm[i]);
+
+		//Set up the values for the new hair
+		auto prev_pos = hair->pos[i];
+		auto prev_p = i;
+
+		for (float j = 1; j < (float)nsegs; j++) {
+			// Compute the next position on the spline
+			auto next_pos = ym::eval_bezier_cubic(raw_curve[0], raw_curve[1], raw_curve[2], raw_curve[3], j / (float)nsegs);
+
+			// Add this new found point to the hair
+			hair->pos[(i*nsegs) + (j - 1) + ncurve] = next_pos;
+			hair->norm[(i*nsegs) + (j - 1) + ncurve] = ym::normalize(next_pos - prev_pos);
+			hair->texcoord[(i*nsegs) + (j - 1) + ncurve] = hair->texcoord[i];
+			hair->lines.push_back({(int) prev_p, ((int) i*nsegs) + ((int) j - 1) + ncurve });
+			
+			// Set up the variables for the next cycle
+			prev_p = (i*nsegs) + (j - 1) + ncurve;
+			prev_pos = next_pos;
+		}
+	}
+
     return hair;
 }
 
@@ -514,8 +611,18 @@ int main(int argc, char** argv) {
 	load_opts.preserve_quads = true;
 	auto scn = yscn::load_scene(scenein, load_opts);
 
+	// add missing data
+	auto add_opts = yscn::add_elements_options::none();
+	add_opts.smooth_normals = true;
+	add_opts.pointline_radius = 0.001f;
+	add_opts.shape_instances = true;
+	add_opts.default_camera = true;
+	yscn::add_elements(scn, add_opts);
+
+
 	// apply subdivision
 	if (subdiv || tesselation) {
+		yu::logging::log_info("Applying subdivision");
 		for (auto shp : scn->shapes) {
 			// hack: pick subdivision level from name
 			if (!yu::string::startswith(shp->name, "subdiv_")) continue;
@@ -536,11 +643,13 @@ int main(int argc, char** argv) {
 	// handle displacement
 	for (auto shp : scn->shapes) {
 		if (!shp->mat->disp_txt.txt) continue;
+		yu::logging::log_info("Applying displacement");
 		displace(shp, 1);
 	}
 
 	// handle faceted rendering
 	if (facets) {
+		yu::logging::log_info("Applying faceting");
 		for (auto shp : scn->shapes) {
 			if (!shp->triangles.empty()) {
 				ym::facet_triangles(shp->triangles, shp->pos, shp->norm,
@@ -560,13 +669,6 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	// add missing data
-	auto add_opts = yscn::add_elements_options::none();
-	add_opts.smooth_normals = true;
-	add_opts.pointline_radius = 0.001f;
-	add_opts.shape_instances = true;
-	add_opts.default_camera = true;
-	yscn::add_elements(scn, add_opts);
 
 	// convert quads to triangles
 	for (auto shp : scn->shapes) {
@@ -574,6 +676,11 @@ int main(int argc, char** argv) {
 		shp->triangles = ym::convert_quads_to_triangles(shp->quads);
 		shp->quads.clear();
 	}
+
+	// Pushing in elements while iterating:
+	// https://media2.giphy.com/media/3oz8xtBx06mcZWoNJm/giphy.gif
+
+	std::vector<yscn::instance*> add_later;
 
 	// make hair
 	if (nhair) {
@@ -590,7 +697,7 @@ int main(int argc, char** argv) {
 			hist->frame = ist->frame;
 			hist->shp = hair;
 			hist->name = ist->name + "_hair";
-			scn->instances.push_back(hist);
+			add_later.push_back(hist);
 			scn->shapes.push_back(hist->shp);
 			scn->materials.push_back(hair->mat);
 		}
@@ -600,7 +707,7 @@ int main(int argc, char** argv) {
 	if (ncurve) {
 		for (auto ist : scn->instances) {
 			// hack skip by using name
-			if (ist->shp->name == "floor") continue;
+			if ( (ist->shp->name) != "" && (ist->shp->name)  == "floor") continue;
 			if (ist->shp->triangles.empty()) continue;
 			auto hair = make_curves(ist->shp, ncurve, 8, 0.001f);
 			hair->name = ist->shp->name + "_curve";
@@ -611,10 +718,15 @@ int main(int argc, char** argv) {
 			hist->frame = ist->frame;
 			hist->shp = hair;
 			hist->name = ist->name + "_hair";
-			scn->instances.push_back(hist);
+			add_later.push_back(hist);
 			scn->shapes.push_back(hair);
 			scn->materials.push_back(hair->mat);
 		}
+	}
+
+
+	for (auto i : add_later) {
+		scn->instances.push_back(i);
 	}
 
 	// create bvh
@@ -631,4 +743,6 @@ int main(int argc, char** argv) {
 	yu::logging::log_info("saving image " + imageout);
 	auto ldr = ym::tonemap_image(hdr, ym::tonemap_type::srgb, 0, 2.2);
 	yimg::save_image4b(imageout, ldr);
+
+	//system("PAUSE");
 }
