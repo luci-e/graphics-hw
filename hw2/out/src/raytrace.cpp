@@ -3,6 +3,8 @@
 #include "yocto_math.h"
 #include "yocto_scn.h"
 #include "yocto_utils.h"
+#include <random>
+#include <chrono>
 
 #define LINE_CENTROID(a,b) ( ((a) + (b)) / 2.f)
 #define TRIANGLE_CENTROID(a,b,c) ( ((a) + (b) + (c)) / 3.f)
@@ -70,8 +72,10 @@ ym::vec4f eval_texture(
 
 ym::vec4f shade(const yscn::scene* scn,
     const std::vector<yscn::instance*>& lights, const ym::vec3f& amb,
-    const ym::ray3f& ray) {
+    const ym::ray3f& ray, float current_light = 1.f) {
     auto isec = yscn::intersect_ray(scn, ray, false);
+
+	if (current_light < 0.3) return { 0, 0, 0, 0 };
     if (!isec) return {0, 0, 0, 0};
 
     auto ist = scn->instances[isec.iid];
@@ -144,7 +148,13 @@ ym::vec4f shade(const yscn::scene* scn,
         }
     }
 
-    return {l.x, l.y, l.z, 1};
+	// Handle opacity for hairs
+	ym::vec3f colour = l;
+	if (mat->op < 1.f) {
+		colour = mat->op*l + (1.f - mat->op)*shade(scn, lights, amb, ym::ray3f(pos, ray.d, 1e-6f), (current_light) * (1- mat->op)).xyz();
+	}
+
+    return { colour.x, colour.y, colour.z, 1};
 }
 
 ym::image4f raytrace(const yscn::scene* scn, const ym::vec3f& amb,
@@ -179,6 +189,17 @@ ym::image4f raytrace(const yscn::scene* scn, const ym::vec3f& amb,
     return img;
 }
 
+
+void timer_start(std::atomic_ulong &counter, unsigned long total, unsigned int interval) {
+	std::thread([&counter, total, interval]() {
+		while (true) {
+			std::cout << "Completion: " << (float)counter / (float)total<< std::endl;
+			std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+		}
+	}).detach();
+}
+
+
 ym::image4f raytrace_mt(const yscn::scene* scn, const ym::vec3f& amb,
     int resolution, int samples, bool facets) {
     auto cam = scn->cameras.front();
@@ -192,10 +213,16 @@ ym::image4f raytrace_mt(const yscn::scene* scn, const ym::vec3f& amb,
         lights.push_back(ist);
     }
 
+	// TODO
+	std::atomic_ulong done_pixels = 0;
+	unsigned long total_pixels = (unsigned long)(img.height() * img.width());
+
+	timer_start(done_pixels, total_pixels, 1000);
+
     auto nthreads = std::thread::hardware_concurrency();
     auto threads = std::vector<std::thread>();
     for (auto tid = 0; tid < nthreads; tid++) {
-        threads.push_back(std::thread([=, &img]() {
+        threads.push_back(std::thread([=, &img, &done_pixels]() {
             for (auto j = tid; j < img.height(); j += nthreads) {
                 for (auto i = 0; i < img.width(); i++) {
                     img[{i, j}] = {0, 0, 0, 0};
@@ -209,11 +236,15 @@ ym::image4f raytrace_mt(const yscn::scene* scn, const ym::vec3f& amb,
                             img.at(i, j) += shade(scn, lights, amb, ray);
                         }
                     }
+	
+					done_pixels++;
                     img[{i, j}] /= (float)(samples * samples);
                 }
             }
         }));
     }
+
+
     for (auto& thread : threads) thread.join();
     return img;
 }
@@ -527,6 +558,104 @@ inline std::array<ym::vec3f, 4> make_rnd_curve(
     return {{v0, v1, v2, v3}};
 }
 
+
+// A struct for holding information about a triangle mesh surface
+struct triangle_surface {
+	std::vector<float> triangle_areas;
+	float total_area = 0.f;
+
+	triangle_surface(size_t triangles) {
+		triangle_areas.resize(triangles);
+	}
+
+	inline const float operator[](size_t i) {
+		return triangle_areas[i];
+	}
+};
+
+inline void get_triangles_areas(
+	int ntriangles, const ym::vec3i* triangles, const ym::vec3f* pos, triangle_surface & tri_a) {
+	for (auto i = 0; i < ntriangles; i++) {
+		tri_a.triangle_areas[i] = ym::triangle_area(
+			pos[triangles[i].x], pos[triangles[i].y], pos[triangles[i].z]);
+		tri_a.total_area += tri_a.triangle_areas[i];
+	}
+}
+
+inline void sample_hair_points(const std::vector<ym::vec3i>& triangles,
+							   const std::vector<ym::vec3f>& pos, const std::vector<ym::vec3f>& norm,
+							   const std::vector<ym::vec2f>& texcoord, int npoints,
+							   std::vector<ym::vec3f>& sampled_pos, std::vector<ym::vec3f>& sampled_norm,
+							   std::vector<ym::vec2f>& sampled_texcoord, uint64_t seed) {
+
+	// Get the areas of the triangles to compute how many points each triangles get
+	auto surfaces = triangle_surface(triangles.size());
+
+	// Compute the cumulative distribution function
+	std::vector<float> triangles_cdf(triangles.size(), 0.f);
+
+	triangles_cdf[0] = surfaces[0] * npoints / surfaces.total_area;
+	for (int i = 1; i < triangles.size(); i++) {
+		triangles_cdf[i] += triangles_cdf[i-1] + ( surfaces[i] * npoints ) / surfaces.total_area;
+	}
+
+	// Start distributing the points
+	for (size_t i = 0; i < npoints; i++) {
+
+	}
+
+}
+
+struct hair_model {
+	float avg_len;
+	float avg_radius;
+	float elastic_modulus;
+	float density;
+
+	float len_var;
+	float rad_var;
+
+	std::default_random_engine generator;
+	std::normal_distribution<float> len_distribution;
+	std::normal_distribution<float> rad_distribution;
+
+	ym::vec4f new_hair() {
+		auto h_length = avg_len + len_distribution(generator);
+		auto h_radius = avg_radius + rad_distribution(generator);
+		auto second_moment_inertia = ym::pif * ym::pow(h_radius, 4) / 4.f;
+		auto m_per_unit_len = ym::pif * (h_radius * h_radius) * density;
+
+		return { h_length, h_radius, second_moment_inertia, m_per_unit_len };
+	}
+
+	hair_model(float avg_len, float avg_radius, float elastic_modulus, float len_var, float rad_var, float density) : avg_len(avg_len), avg_radius(avg_radius),
+	elastic_modulus(elastic_modulus), len_var(len_var), rad_var(rad_var), density(density){
+		this->len_distribution = std::normal_distribution<float>(0.f, len_var);
+		this->rad_distribution = std::normal_distribution<float>(0.f, rad_var);
+	};
+};
+
+inline std::vector<ym::vec3f> eval_deflection(ym::vec4f hair_info, float elastic_modulus, ym::vec3f acc_vector, ym::vec3f hair_direction, int nsegs) {
+	auto deflections = std::vector<ym::vec3f>(nsegs);
+
+	// If they are really close in direction weird things happen if they're multiplied directly so 
+	// I guess we'll stick to dot and product
+	auto deflect_component = acc_vector - ( ym::dot(acc_vector, hair_direction) * hair_direction);
+	//print_vector(deflect_component, "Deflect: ", 3u);
+	auto deflect_direction = ym::normalize(deflect_component);
+
+	// Deflection along the axis is equal to 
+	//      q x^2  
+	// dx + ------ (6L^2 - 4Lx^2 + x^2)
+	//      24 E I
+	for (int i = 1; i <= nsegs; i++) {
+		auto x = (float)i  * hair_info.x / (float)nsegs;
+		deflections[i - 1] = deflect_direction * (hair_info.w * ym::length(deflect_component) * (x*x) * (6 * hair_info.x * hair_info.x - 4 * hair_info.x * x * x + x*x) / (24 * elastic_modulus * hair_info.z));
+	}
+
+	return deflections;
+}
+
 //
 // Add ncurve Bezier curves to the shape. Each curcve should be sampled with
 // `ym::sample_triangles_points()` and then created using `make_rnd_curve()`.
@@ -534,8 +663,60 @@ inline std::array<ym::vec3f, 4> make_rnd_curve(
 // segments per curve. the final shape contains all tesselated curves as lines.
 //
 yscn::shape* make_curves(
-    const yscn::shape* shp, int ncurve, int nsegs, float radius) {
+    const yscn::shape* shp, int ncurve, int nsegs, hair_model hair_m, ym::vec3f acc_vector) {
     auto hair = new yscn::shape();
+
+	// Make space for the hairification
+	hair->lines.reserve(nsegs * ncurve);
+
+	// Set one radius for all ( we can do better )
+	hair->radius.resize((nsegs + 1) * ncurve);
+
+	ym::sample_triangles_points(shp->triangles, shp->pos, shp->norm, shp->texcoord, ncurve, hair->pos, hair->norm, hair->texcoord, 0u);
+
+	// Expand the vectors to nsegs + 1 * the number of hairs
+	hair->pos.resize((nsegs + 1) * ncurve);
+	hair->norm.resize((nsegs + 1) * ncurve);
+	hair->texcoord.resize((nsegs + 1) * ncurve);
+
+
+	for (size_t i = 0; i < ncurve; i++) {
+		auto hair_direction = hair->norm[i];
+
+		// Make a new hair
+		auto n_hair = hair_m.new_hair();
+
+		hair->radius[i] = n_hair.y;
+
+		auto deflections = eval_deflection(n_hair, hair_m.elastic_modulus, acc_vector, hair->norm[i], nsegs);
+
+		//Set up the values for the new hair
+		auto prev_pos = hair->pos[i];
+		auto prev_p = i;
+
+		for (float j = 1; j <= (float) nsegs; j++) {
+			// Compute the next position on the spline
+			auto next_pos = hair->pos[i] + n_hair.x * hair_direction * (j / (float)nsegs) + deflections[j-1];
+
+			// Add this new found point to the hair
+			hair->pos[(i*nsegs) + (j - 1) + ncurve] = next_pos;
+			hair->norm[(i*nsegs) + (j - 1) + ncurve] = ym::normalize(next_pos - prev_pos);
+			hair->radius[(i*nsegs) + (j - 1) + ncurve] = n_hair.y;
+			hair->texcoord[(i*nsegs) + (j - 1) + ncurve] = hair->texcoord[i];
+			hair->lines.push_back({(int) prev_p, ((int) i*nsegs) + ((int) j - 1) + ncurve });
+			
+			// Set up the variables for the next cycle
+			prev_p = (i*nsegs) + (j - 1) + ncurve;
+			prev_pos = next_pos;
+		}
+	}
+
+    return hair;
+}
+
+yscn::shape* make_curves_2(
+	const yscn::shape* shp, int ncurve, int nsegs, float radius) {
+	auto hair = new yscn::shape();
 
 	// Make space for the hairification
 	hair->lines.reserve(nsegs * ncurve);
@@ -566,15 +747,15 @@ yscn::shape* make_curves(
 			hair->pos[(i*nsegs) + (j - 1) + ncurve] = next_pos;
 			hair->norm[(i*nsegs) + (j - 1) + ncurve] = ym::normalize(next_pos - prev_pos);
 			hair->texcoord[(i*nsegs) + (j - 1) + ncurve] = hair->texcoord[i];
-			hair->lines.push_back({(int) prev_p, ((int) i*nsegs) + ((int) j - 1) + ncurve });
-			
+			hair->lines.push_back({ (int)prev_p, ((int)i*nsegs) + ((int)j - 1) + ncurve });
+
 			// Set up the variables for the next cycle
 			prev_p = (i*nsegs) + (j - 1) + ncurve;
 			prev_pos = next_pos;
 		}
 	}
 
-    return hair;
+	return hair;
 }
 
 int main(int argc, char** argv) {
@@ -703,15 +884,23 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	//TODO remove later
+	auto hair_m = hair_model(0.2f, 1.2e-3f, 7e4, 0.02f, 2e-4f, 1.f);
+
 	// make curve
 	if (ncurve) {
 		for (auto ist : scn->instances) {
 			// hack skip by using name
 			if ( (ist->shp->name) != "" && (ist->shp->name)  == "floor") continue;
 			if (ist->shp->triangles.empty()) continue;
-			auto hair = make_curves(ist->shp, ncurve, 8, 0.001f);
+			// TODO
+			auto acc_vector = ist->xform() * ym::vec4f{ 0.f, 9.8f, 0.f, 0.f };
+			auto hair = make_curves(ist->shp, ncurve, 8, hair_m, acc_vector.xyz());
+
 			hair->name = ist->shp->name + "_curve";
 			hair->mat = new yscn::material();
+			// TODO
+			hair->mat->op = 0.5f;
 			hair->mat->kd = ist->shp->mat->kd;
 			hair->mat->kd_txt = ist->shp->mat->kd_txt;
 			auto hist = new yscn::instance();
