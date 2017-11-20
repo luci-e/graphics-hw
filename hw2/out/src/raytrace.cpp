@@ -10,6 +10,11 @@
 #define TRIANGLE_CENTROID(a,b,c) ( ((a) + (b) + (c)) / 3.f)
 #define QUAD_CENTROID(a,b,c,d) ( ((a) + (b) + (c) + (d)) / 4.f)
 
+struct point_info {
+	ym::vec3f point;
+	ym::vec3f normal;
+	ym::vec2f texture_coords;
+};
 
 template <typename T>
 const void print_vector(T vector, std::string prefix, int size) {
@@ -19,8 +24,24 @@ const void print_vector(T vector, std::string prefix, int size) {
 	for (int i = 0; i < size; i++) {
 		std::cout << " " << vector[i];
 	}
+}
 
-	std::cout << std::endl;
+const void print_image(ym::image4f *img, int n, int m) {
+	for (int i = 0; i < n; i++) {
+		for (int j = 0; j < m; j++) {
+			print_vector(img->at({ i,j }), "", 4u);
+		}
+		std::cout << std::endl;
+	}
+}
+
+const void print_image(ym::image4b *img, int n, int m) {
+	for (int i = 0; i < n; i++) {
+		for (int j = 0; j < m; j++) {
+			print_vector(img->at({ i,j }), "", 4u);
+		}
+		std::cout << std::endl;
+	}
 }
 
 ym::ray3f eval_camera(const yscn::camera* cam, const ym::vec2f& uv) {
@@ -70,7 +91,256 @@ ym::vec4f eval_texture(
             lookup_texture(txt, idx[3], srgb) * w.w);
 }
 
+ym::vec3f barycentric_to_vec(ym::vec4f bar_coord, std::vector<ym::vec3f> vecs, int vec_no) {
+	ym::vec3f vec = { 0, 0, 0 };
+	for (int i = 0; i < vec_no; i++) {
+		vec += bar_coord[i] * vecs[i];
+	}
+	return vec;
+}
+
+inline ym::vec3f triangle_barycentric_to_vec(ym::vec2f uv, std::array<ym::vec3f, 3u> vertices) {
+	return vertices[0] + uv.x * (vertices[1] - vertices[0]) + uv.y*(vertices[2] - vertices[0]);
+}
+
+inline ym::vec2f triangle_barycentric_to_vec(ym::vec2f uv, std::array<ym::vec2f, 3u> vertices) {
+	return vertices[0] + uv.x * (vertices[1] - vertices[0]) + uv.y*(vertices[2] - vertices[0]);
+}
+
+ym::vec2f barycentric_to_vec(ym::vec4f bar_coord, std::vector<ym::vec2f> vecs, int vec_no) {
+	ym::vec2f vec = { 0, 0 };
+	for (int i = 0; i < vec_no; i++) {
+		vec += bar_coord[i] * vecs[i];
+	}
+	return vec;
+}
+
+// Compute the opaqueness at the intersection point
+float opaqueness_at_intersection(const yscn::scene* scn, const yscn::intersection_point intersection) {
+	float op;
+	auto instance = scn->instances[intersection.iid];
+	auto shape = instance->shp;
+	auto mat = shape->mat;
+
+	op = mat->op;
+
+	if (shape->texcoord.size() > 0 && mat->occ_txt.txt) {
+		ym::vec2f texture_coords;
+		if (shape->points.size() != 0) {
+			auto p = shape->points[intersection.eid];
+			texture_coords = shape->texcoord[p];
+		}
+		else if (shape->lines.size() != 0) {
+			auto l = shape->lines[intersection.eid];
+			std::vector<ym::vec2f> textures = { shape->texcoord[l[0]], shape->texcoord[l[1]] };
+			texture_coords = barycentric_to_vec(intersection.euv, textures, 2);
+		}
+		else if (shape->triangles.size() != 0) {
+			auto t = shape->triangles[intersection.eid];
+			std::vector<ym::vec2f> textures = { shape->texcoord[t[0]], shape->texcoord[t[1]], shape->texcoord[t[2]] };
+			texture_coords = barycentric_to_vec(intersection.euv, textures, 3);
+		}
+
+		op *= eval_texture(mat->occ_txt.txt, texture_coords, false)[0];
+	}
+
+	return op;
+}
+
+point_info get_point_info(const yscn::scene* scn, const yscn::intersection_point intersection, bool is_textured = false) {
+	point_info p_i;
+	auto shape = scn->instances[intersection.iid]->shp;
+
+	// Determine the type of shape
+	if (shape->points.size() != 0) {
+		auto p = shape->points[intersection.eid];
+		p_i.point = shape->pos[p];
+		p_i.normal = shape->norm[p];
+		if (is_textured) {
+			p_i.texture_coords = shape->texcoord[p];
+		}
+	}
+	else if (shape->lines.size() != 0) {
+		auto l = shape->lines[intersection.eid];
+		std::vector<ym::vec3f> vectors = { shape->pos[l[0]], shape->pos[l[1]] };
+		std::vector<ym::vec3f> normals = { shape->norm[l[0]], shape->norm[l[1]] };
+
+		// Goodbye simmetry hello efficiency
+		if (is_textured) {
+			std::vector<ym::vec2f> textures = { shape->texcoord[l[0]], shape->texcoord[l[1]] };
+			p_i.texture_coords = barycentric_to_vec(intersection.euv, textures, 2);
+		}
+
+		p_i.point = barycentric_to_vec(intersection.euv, vectors, 2);
+		p_i.normal = ym::normalize(barycentric_to_vec(intersection.euv, normals, 2));
+	}
+	else if (shape->triangles.size() != 0) {
+		auto t = shape->triangles[intersection.eid];
+		std::vector<ym::vec3f> vectors = { shape->pos[t[0]], shape->pos[t[1]], shape->pos[t[2]] };
+		std::vector<ym::vec3f> normals = { shape->norm[t[0]], shape->norm[t[1]], shape->norm[t[2]] };
+
+		// Goodbye simmetry hello efficiency
+		if (is_textured) {
+			std::vector<ym::vec2f> textures = { shape->texcoord[t[0]], shape->texcoord[t[1]], shape->texcoord[t[2]] };
+			p_i.texture_coords = barycentric_to_vec(intersection.euv, textures, 3);
+		}
+
+		p_i.point = barycentric_to_vec(intersection.euv, vectors, 3);
+		p_i.normal = ym::normalize(barycentric_to_vec(intersection.euv, normals, 3));
+	}
+
+	return p_i;
+};
+
+ym::vec4f shade_light(const yscn::scene* scn, const yscn::instance* light, const int light_point, const ym::ray3f& ray, bool coloured_light = false) {
+	ym::vec3f light_colour;
+
+	auto light_shape = light->shp;
+	auto light_mat = light_shape->mat;
+	auto light_transform = light->xform();
+
+	auto light_pos = light_shape->pos[light_point];
+	// Bring back to world coord
+	light_pos = ym::transform_point(light_transform, light_pos);
+
+	auto light_direction = ym::normalize(light_pos - ray.o);
+	auto light_distance = ym::length(light_pos - ray.o);
+
+	auto light_intersection = yscn::intersect_ray(scn, ym::ray3f(ray.o, ray.d, 1e-6f, light_distance), false);
+
+	// Dafuq did we hit?
+	if (coloured_light) {
+		if (light_intersection && !(scn->instances[light_intersection.iid] == light)) {
+			auto light_hit_instance = scn->instances[light_intersection.iid];
+			float light_op;
+			if ((light_op = opaqueness_at_intersection(scn, light_intersection)) < 1) {
+				auto mat = light_hit_instance->shp->mat;
+				auto kd = mat->kd;
+				bool is_textured = (mat->kd_txt) ? true : false;
+
+				auto light_hit_point_i = get_point_info(scn, light_intersection, is_textured);
+				auto light_hit_point = light_hit_point_i.point;
+
+				if (is_textured) {
+					auto kd_4 = eval_texture(mat->kd_txt.txt, light_hit_point_i.texture_coords, true);
+					kd *= { kd_4[0], kd_4[1], kd_4[2] };
+				}
+
+				light_hit_point = ym::transform_point(light_hit_instance->xform(), light_hit_point);
+				auto light_hit_colour = shade_light(scn, light, light_point, ym::ray3f(light_hit_point, light_direction, 1e-6f));
+				if (light_hit_colour[3] < 1.f) {
+					return (1.f - light_op) * ym::vec4f{ kd[0] * light_hit_colour[0], kd[1] * light_hit_colour[1], kd[2] * light_hit_colour[2], 1.f };
+				}
+			}
+			// President Shader, an opaque body is blocking our lights in Brazil
+			// SHUT. DOWN. EVERYTHING!
+			return { 0.f, 0.f, 0.f, 1.f };
+		}
+	}
+
+	// If we intersect a light we can finally return a light intensity!
+	if (!light_intersection || (scn->instances[light_intersection.iid] == light)) {
+		return { light_mat->ke[0], light_mat->ke[1], light_mat->ke[2], 0.f };
+	}
+
+	return { 0.f, 0.f, 0.f, 1.f };
+}
+
+
 ym::vec4f shade(const yscn::scene* scn,
+				const std::vector<yscn::instance*>& lights, const ym::vec3f& amb,
+				const ym::ray3f& ray, float current_light = 1.f) {
+	auto isec = yscn::intersect_ray(scn, ray, false);
+
+	if (current_light < 0.3) return { 0, 0, 0, 0 };
+	if (!isec) return { 0, 0, 0, 0 };
+
+	auto ist = scn->instances[isec.iid];
+	auto shp = ist->shp;
+	auto mat = shp->mat;
+
+	auto pos = ym::zero3f;
+	auto norm = ym::zero3f;
+	auto texcoord = ym::zero2f;
+	if (!shp->triangles.empty()) {
+		auto t = shp->triangles[isec.eid];
+		pos = ym::eval_barycentric_triangle(
+			shp->pos[t.x], shp->pos[t.y], shp->pos[t.z], isec.euv);
+		norm = ym::normalize(ym::eval_barycentric_triangle(
+			shp->norm[t.x], shp->norm[t.y], shp->norm[t.z], isec.euv));
+		if (!shp->texcoord.empty())
+			texcoord = ym::eval_barycentric_triangle(shp->texcoord[t.x],
+													 shp->texcoord[t.y], shp->texcoord[t.z], isec.euv);
+	}
+	else if (!shp->lines.empty()) {
+		auto l = shp->lines[isec.eid];
+		pos = ym::eval_barycentric_line(shp->pos[l.x], shp->pos[l.y], isec.euv);
+		norm = ym::normalize(ym::eval_barycentric_line(
+			shp->norm[l.x], shp->norm[l.y], isec.euv));
+		if (!shp->texcoord.empty())
+			texcoord = ym::eval_barycentric_line(
+			shp->texcoord[l.x], shp->texcoord[l.y], isec.euv);
+	}
+	else if (!shp->points.empty()) {
+		auto p = shp->points[isec.eid];
+		pos = shp->pos[p];
+		norm = shp->norm[p];
+		if (!shp->texcoord.empty()) texcoord = shp->texcoord[p];
+	}
+
+	pos = ym::transform_point(ym::to_frame(ist->xform()), pos);
+	norm = ym::transform_direction(ym::to_frame(ist->xform()), norm);
+
+	auto ke = mat->ke * eval_texture(mat->ke_txt.txt, texcoord).xyz();
+	auto kd = mat->kd * eval_texture(mat->kd_txt.txt, texcoord).xyz();
+	auto ks = mat->ks * eval_texture(mat->ks_txt.txt, texcoord).xyz();
+	auto ns = (mat->rs) ? 2 / (mat->rs * mat->rs) - 2 : 1e6f;
+
+	auto l = ke + kd * amb;
+	for (auto lgt : lights) {
+		auto lshp = lgt->shp;
+		for (auto p : lgt->shp->points) {
+			auto lpos =
+				ym::transform_point(ym::to_frame(lgt->xform()), lshp->pos[p]);
+			auto lr = ym::length(lpos - pos);
+			auto wi = ym::normalize(lpos - pos);
+
+			auto light = shade_light(scn, lgt, p, { pos, wi, 0.01f, lr - 0.04f }, true);
+			
+			if (light[3] != 1.f) {
+				auto le = light.xyz() / (lr * lr * ym::pif);  // normalized to pi, why?
+
+				auto wo = -ray.d;
+				auto wh = ym::normalize(wi + wo);
+				if (!shp->triangles.empty()) {
+					l += le * kd * ym::max(0.0f, ym::dot(norm, wi)) +
+						le * ks * ym::pow(ym::max(0.0f, ym::dot(norm, wh)), ns);
+				}
+				else if (!shp->lines.empty()) {
+					l += le * kd *
+						ym::sqrt(ym::clamp(
+						1 - ym::dot(norm, wi) * ym::dot(norm, wi), 0.0f,
+						1.0f)) +
+						le * ks *
+						ym::pow(ym::sqrt(ym::clamp(
+						1 - ym::dot(norm, wh) * ym::dot(norm, wh),
+						0.0f, 1.0f)),
+						ns);
+				}
+			}
+		}
+	}
+
+	// Handle opacity for hairs
+	ym::vec3f colour = l;
+	if (mat->op < 1.f) {
+		colour = mat->op*l + (1.f - mat->op)*shade(scn, lights, amb, ym::ray3f(pos, ray.d, 1e-6f), (current_light) * (1 - mat->op)).xyz();
+	}
+
+	return { colour.x, colour.y, colour.z, 1 };
+}
+
+ym::vec4f shade_2(const yscn::scene* scn,
     const std::vector<yscn::instance*>& lights, const ym::vec3f& amb,
     const ym::ray3f& ray, float current_light = 1.f) {
     auto isec = yscn::intersect_ray(scn, ray, false);
@@ -449,7 +719,6 @@ void tesselate(yscn::shape* shp, int level) {
 	yu::logging::log_error("Sorry mate, only triangles and quads\n");
 }
 
-
 void smooth_quad_mesh(yscn::shape *shp) {
 	auto original_mesh = shp->pos;
 	auto avg_v = std::vector < ym::vec3f > (shp->pos.size());
@@ -522,7 +791,7 @@ yscn::shape* make_hair(
 	// Make space for the hairification
 	hair->lines.resize(nhair);
 
-	// Set one radius for all ( we can do better )
+	// Set one radius for all
 	hair->radius.resize(2 * nhair);
 	std::fill_n(hair->radius.begin(), (2 * nhair), radius);
 
@@ -574,7 +843,7 @@ struct triangle_surface {
 };
 
 inline void get_triangles_areas(
-	int ntriangles, const ym::vec3i* triangles, const ym::vec3f* pos, triangle_surface & tri_a) {
+	int ntriangles, const std::vector<ym::vec3i>& triangles, const std::vector<ym::vec3f>& pos, triangle_surface & tri_a) {
 	for (auto i = 0; i < ntriangles; i++) {
 		tri_a.triangle_areas[i] = ym::triangle_area(
 			pos[triangles[i].x], pos[triangles[i].y], pos[triangles[i].z]);
@@ -582,28 +851,70 @@ inline void get_triangles_areas(
 	}
 }
 
-inline void sample_hair_points(const std::vector<ym::vec3i>& triangles,
+inline size_t generate_points_on_triangle(const yscn::shape *shp, const std::vector<ym::vec3i>& triangles,
+								   const std::vector<ym::vec3f>& pos, const std::vector<ym::vec3f>& norm,
+								   const std::vector<ym::vec2f>& texcoord,
+								   std::vector<ym::vec3f>& sampled_pos, std::vector<ym::vec3f>& sampled_norm,
+								   std::vector<ym::vec2f>& sampled_texcoord, uint64_t seed, size_t triangle_no, triangle_surface &surfaces, ym::rng_pcg32 &rng) {
+	// The current triangle
+	auto &triangle = triangles[triangle_no];
+
+	// Eval the centroid of the texture, multiply the density value of the texture by the area of the triangle
+	// to get the expected value of hairs in the triangle, multiply by a constant cause density only goes up 
+	// to 255 hairs / unit squared which is clearly too small
+	auto tex_centroid = TRIANGLE_CENTROID(eval_texture(shp->mat->density_txt.txt, texcoord[triangle[0]], false),
+										  eval_texture(shp->mat->density_txt.txt, texcoord[triangle[1]], false),
+										  eval_texture(shp->mat->density_txt.txt, texcoord[triangle[2]], false));
+
+	auto expected = tex_centroid.x * 8e6  / 255.f * surfaces[triangle_no];
+
+	size_t generated_hair_no = 0u;
+
+	// Compute two barycentric coordinates by generating two floats, summing the second to the first and taking the 1.f modulus
+	for (auto i = 0.f; i < expected; i++) {
+		auto diff = (expected - i);
+
+		// If there should be less than 1 hair, flip a coin to decide whether to put it or not
+		if (diff < 1.f) {
+			auto put_hair = ym::next_rand1f(rng) <= diff;
+			if (!put_hair) { continue; };
+		}
+
+		generated_hair_no++;
+
+		auto uv = ym::next_rand2f(rng);
+		uv.y = std::fmodf(uv.x + uv.y, 1.f);
+
+		//Fill the values
+		sampled_pos.push_back(triangle_barycentric_to_vec(uv, { pos[triangle[0]], pos[triangle[1]], pos[triangle[2]] }));
+		sampled_norm.push_back(triangle_barycentric_to_vec(uv, { norm[triangle[0]], norm[triangle[1]], norm[triangle[2]] }));
+		sampled_texcoord.push_back(triangle_barycentric_to_vec(uv, { texcoord[triangle[0]], texcoord[triangle[1]], texcoord[triangle[2]] }));
+	}
+
+	return generated_hair_no;
+}
+
+// Sample points from density map, returns the number of hair generated
+inline size_t sample_points_with_density_map(const yscn::shape *shp, const std::vector<ym::vec3i>& triangles,
 							   const std::vector<ym::vec3f>& pos, const std::vector<ym::vec3f>& norm,
-							   const std::vector<ym::vec2f>& texcoord, int npoints,
+							   const std::vector<ym::vec2f>& texcoord,
 							   std::vector<ym::vec3f>& sampled_pos, std::vector<ym::vec3f>& sampled_norm,
 							   std::vector<ym::vec2f>& sampled_texcoord, uint64_t seed) {
 
-	// Get the areas of the triangles to compute how many points each triangles get
+	// Get the areas of the triangles to compute how many points each triangle get
 	auto surfaces = triangle_surface(triangles.size());
+	get_triangles_areas(triangles.size(), triangles, pos, surfaces);
 
-	// Compute the cumulative distribution function
-	std::vector<float> triangles_cdf(triangles.size(), 0.f);
+	auto rng = ym::init_rng_pcg32(seed, 0u);
 
-	triangles_cdf[0] = surfaces[0] * npoints / surfaces.total_area;
-	for (int i = 1; i < triangles.size(); i++) {
-		triangles_cdf[i] += triangles_cdf[i-1] + ( surfaces[i] * npoints ) / surfaces.total_area;
+	size_t total_hairs = 0;
+
+	// Loop over the triangles, generate the points
+	for (size_t i = 0; i < triangles.size(); i++) {
+		total_hairs += generate_points_on_triangle(shp, triangles, pos, norm, texcoord, sampled_pos, sampled_norm, sampled_texcoord, seed, i, surfaces, rng);
 	}
 
-	// Start distributing the points
-	for (size_t i = 0; i < npoints; i++) {
-
-	}
-
+	return total_hairs;
 }
 
 struct hair_model {
@@ -635,26 +946,72 @@ struct hair_model {
 	};
 };
 
-inline std::vector<ym::vec3f> eval_deflection(ym::vec4f hair_info, float elastic_modulus, ym::vec3f acc_vector, ym::vec3f hair_direction, int nsegs) {
+inline ym::vec3f eval_deflection(ym::vec4f hair_info, float elastic_modulus, ym::vec3f acc_vector, ym::vec3f hair_direction, int nsegs, int current_segment) {
+	ym::vec3f deflection;
+	auto seg_len = hair_info.x / (float)nsegs;
+
+	auto deflect_component = acc_vector - (ym::dot(acc_vector, hair_direction) * hair_direction);
+	auto deflect_direction = ym::normalize(deflect_component);
+	auto deflect_line = ym::normalize(acc_vector);
+
+	// Deflection along the axis is equal to 
+	//
+	//       q x^2  
+	// dx = -------- (6L^2 - 4Lx^2 + x^2)
+	//       24 E I
+	//
+	// for a uniformly loaded cantilever beam, we can approximate better the deflection by segmenting the computations
+	// that is, considering the hair as connected beams that are affected both by their own weight and the weight of
+	// the next segment they hold. The equation for this is:
+	//
+	//      a * seg_len^3 * attached_segments^2  
+	// dx = -----------------------------------
+	//                     4 E I
+	//
+
+
+	auto remaing_len = (float)( nsegs - current_segment + 1.f) * seg_len;
+	deflection = (deflect_direction * (hair_info.w * ym::length(deflect_component) * seg_len * seg_len * seg_len) * (float) ((nsegs - current_segment + 1.f ) * (nsegs - current_segment + 1.f)) / ( 4.f * elastic_modulus * hair_info.z ));
+	
+	return deflection;
+}
+
+inline std::vector<ym::vec3f> eval_short_deflections(ym::vec4f hair_info, float elastic_modulus, ym::vec3f acc_vector, ym::vec3f hair_direction, int nsegs) {
 	auto deflections = std::vector<ym::vec3f>(nsegs);
 
-	// If they are really close in direction weird things happen if they're multiplied directly so 
-	// I guess we'll stick to dot and product
-	auto deflect_component = acc_vector - ( ym::dot(acc_vector, hair_direction) * hair_direction);
-	//print_vector(deflect_component, "Deflect: ", 3u);
+	auto deflect_component = acc_vector - (ym::dot(acc_vector, hair_direction) * hair_direction);
 	auto deflect_direction = ym::normalize(deflect_component);
 
 	// Deflection along the axis is equal to 
-	//      q x^2  
-	// dx + ------ (6L^2 - 4Lx^2 + x^2)
-	//      24 E I
+	//
+	//       q x^2  
+	// dx = -------- (6L^2 - 4Lx^2 + x^2)
+	//       24 E I
+	//
+	// for a uniformly loaded cantilever beam, that we use in case the hair is very short
+
+	auto seg_len = hair_info.x / (float)nsegs;
+
 	for (int i = 1; i <= nsegs; i++) {
-		auto x = (float)i  * hair_info.x / (float)nsegs;
-		deflections[i - 1] = deflect_direction * (hair_info.w * ym::length(deflect_component) * (x*x) * (6 * hair_info.x * hair_info.x - 4 * hair_info.x * x * x + x*x) / (24 * elastic_modulus * hair_info.z));
+		auto x = i * seg_len;
+		deflections[i - 1] = deflect_direction * (hair_info.w * ym::length(deflect_component) * (x*x) * (6 * hair_info.x * hair_info.x - 4 * hair_info.x * x * x + x * x) / (24 * elastic_modulus * hair_info.z));
 	}
 
 	return deflections;
 }
+
+ym::vec3f get_combing_vector(const yscn::shape* shp, const yscn::shape* hair, int i) {
+	auto tex = eval_texture(shp->mat->comb_txt.txt, hair->texcoord[i], false).xyz() * 255.f;
+	tex = (tex - ym::vec3f{ 127.f, 127.f, 127.f }) / 127.f;
+
+	// Compute the plane
+	auto frame_z = hair->norm[i];
+	auto frame_x = ym::normalize(ym::vec3f{ -frame_z.y, frame_z.x, 0.f });
+	auto frame_y = ym::normalize(ym::vec3f{ frame_z.y, -frame_z.x, 0.f });
+
+	return tex.x * frame_x + tex.y * frame_y + tex.z * frame_z;
+}
+
 
 //
 // Add ncurve Bezier curves to the shape. Each curcve should be sampled with
@@ -663,22 +1020,32 @@ inline std::vector<ym::vec3f> eval_deflection(ym::vec4f hair_info, float elastic
 // segments per curve. the final shape contains all tesselated curves as lines.
 //
 yscn::shape* make_curves(
-    const yscn::shape* shp, int ncurve, int nsegs, hair_model hair_m, ym::vec3f acc_vector) {
-    auto hair = new yscn::shape();
+	const yscn::scene * scn, const yscn::shape* shp, int ncurve, int nsegs, hair_model hair_m, ym::vec3f acc_vector) {
+	auto hair = new yscn::shape();
+
+	if (ncurve != -1 && !shp->mat->density_txt) {
+		ym::sample_triangles_points(shp->triangles, shp->pos, shp->norm, shp->texcoord, ncurve, hair->pos, hair->norm, hair->texcoord, 0u);
+	} else {
+		// If the curves are -1 assume that we've been passed a density map
+		// but don't actually trust that we've been passed one cause I don't trust myself.
+		ncurve = sample_points_with_density_map(shp, shp->triangles, shp->pos, shp->norm, shp->texcoord, hair->pos, hair->norm, hair->texcoord, 0u);
+	}
 
 	// Make space for the hairification
 	hair->lines.reserve(nsegs * ncurve);
-
 	// Set one radius for all ( we can do better )
 	hair->radius.resize((nsegs + 1) * ncurve);
-
-	ym::sample_triangles_points(shp->triangles, shp->pos, shp->norm, shp->texcoord, ncurve, hair->pos, hair->norm, hair->texcoord, 0u);
 
 	// Expand the vectors to nsegs + 1 * the number of hairs
 	hair->pos.resize((nsegs + 1) * ncurve);
 	hair->norm.resize((nsegs + 1) * ncurve);
 	hair->texcoord.resize((nsegs + 1) * ncurve);
 
+	// If we got a comb texture apply it later
+	bool is_combed = (shp->mat->comb_txt.txt) ? true : false;
+	ym::vec3f combing_vec;
+
+	auto acc_direction = ym::normalize(acc_vector);
 
 	for (size_t i = 0; i < ncurve; i++) {
 		auto hair_direction = hair->norm[i];
@@ -686,35 +1053,79 @@ yscn::shape* make_curves(
 		// Make a new hair
 		auto n_hair = hair_m.new_hair();
 
-		hair->radius[i] = n_hair.y;
+		if (is_combed) {
+			combing_vec = n_hair.x * get_combing_vector(shp, hair, i);
+		}
 
-		auto deflections = eval_deflection(n_hair, hair_m.elastic_modulus, acc_vector, hair->norm[i], nsegs);
+		hair->radius[i] = n_hair.y;
 
 		//Set up the values for the new hair
 		auto prev_pos = hair->pos[i];
+		auto prev_norm = hair->norm[i];
 		auto prev_p = i;
 
-		for (float j = 1; j <= (float) nsegs; j++) {
-			// Compute the next position on the spline
-			auto next_pos = hair->pos[i] + n_hair.x * hair_direction * (j / (float)nsegs) + deflections[j-1];
+		auto seg_len = n_hair.x / (float)nsegs;
+		std::vector<ym::vec3f> deflections;
+
+		if (n_hair.x < 0.2f) {
+			deflections = eval_short_deflections(n_hair, hair_m.elastic_modulus, acc_vector, hair->norm[i], nsegs);
+		}
+
+		for (float j = 1; j <= (float)nsegs; j++) {
+			ym::vec3f deflection;
+			ym::vec3f next_pos;
+
+			// Compute the next position on the curve
+			if (n_hair.x < 0.2f) {
+				deflection = deflections[j - 1];
+				next_pos = hair->pos[i] + (n_hair.x * hair_direction + ((is_combed) ? combing_vec : ym::vec3f{ 0.f, 0.f, 0.f })) * (j / (float)nsegs) + deflection;
+			}else {
+				// Segmentation introduces weird quirks, we use a dirty trick to make the next point line up 
+				// with the acceleration vector. This is "wrong" but I couldn't care less.
+				deflection = eval_deflection(n_hair, hair_m.elastic_modulus, acc_vector, prev_norm, nsegs, (int)j);
+				auto line_pos = prev_pos + seg_len * prev_norm;
+				auto max_pos = prev_pos + seg_len * acc_direction;
+
+				if (ym::length(max_pos - line_pos) < ym::length(deflection)) {
+					next_pos = max_pos ;
+				} else {
+					next_pos = line_pos + deflection;
+				}
+
+				next_pos += ((is_combed) ? combing_vec : ym::vec3f{ 0.f, 0.f, 0.f }) * (j / (float)nsegs);
+			}
+
+			auto next_norm = ym::normalize(next_pos - prev_pos);
+
+			// We don't really want hair to intersect with shapes cause that is not very realistic so we do a quick check
+			// and if we intersect something 
+			if (auto intersection = yscn::intersect_ray(scn, ym::ray3f{ prev_pos, next_norm, 1e-6f, ym::length(next_pos - prev_pos) }, true)) {
+				auto p_info = get_point_info(scn, intersection, false);
+				auto lifted_pos = p_info.point + 1e-6f * p_info.normal;
+				next_norm = ym::normalize(lifted_pos - prev_pos);
+				next_pos = prev_pos + seg_len * next_norm;
+			}
+
+			auto next_p = (int)((i*nsegs) + (j - 1) + ncurve);
 
 			// Add this new found point to the hair
-			hair->pos[(i*nsegs) + (j - 1) + ncurve] = next_pos;
-			hair->norm[(i*nsegs) + (j - 1) + ncurve] = ym::normalize(next_pos - prev_pos);
-			hair->radius[(i*nsegs) + (j - 1) + ncurve] = n_hair.y;
-			hair->texcoord[(i*nsegs) + (j - 1) + ncurve] = hair->texcoord[i];
-			hair->lines.push_back({(int) prev_p, ((int) i*nsegs) + ((int) j - 1) + ncurve });
-			
+			hair->pos[next_p] = next_pos;
+			hair->norm[next_p] = next_norm;
+			hair->radius[next_p] = n_hair.y;
+			hair->texcoord[next_p] = hair->texcoord[i];
+			hair->lines.push_back({ (int)prev_p, next_p });
+
 			// Set up the variables for the next cycle
-			prev_p = (i*nsegs) + (j - 1) + ncurve;
+			prev_p = next_p;
 			prev_pos = next_pos;
+			prev_norm = next_norm;
 		}
 	}
 
-    return hair;
+	return hair;
 }
 
-yscn::shape* make_curves_2(
+yscn::shape* make_curves_simple(
 	const yscn::shape* shp, int ncurve, int nsegs, float radius) {
 	auto hair = new yscn::shape();
 
@@ -774,6 +1185,8 @@ int main(int argc, char** argv) {
 		yu::cmdline::parse_flag(parser, "--subdiv", "-S", "enable subdivision");
 	auto tesselation = yu::cmdline::parse_flag(
 		parser, "--tesselation", "-T", "enable tesselation");
+	auto natural_hair = yu::cmdline::parse_flag(
+		parser, "--natural", "-n", "enable natural hair");
 	auto resolution = yu::cmdline::parse_opti(
 		parser, "--resolution", "-r", "vertical resolution", 720);
 	auto samples = yu::cmdline::parse_opti(
@@ -858,6 +1271,8 @@ int main(int argc, char** argv) {
 		shp->quads.clear();
 	}
 
+
+
 	// Pushing in elements while iterating:
 	// https://media2.giphy.com/media/3oz8xtBx06mcZWoNJm/giphy.gif
 
@@ -884,23 +1299,34 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	//TODO remove later
-	auto hair_m = hair_model(0.2f, 1.2e-3f, 7e4, 0.02f, 2e-4f, 1.f);
+	// The model used for the hair
+	auto hair_m = hair_model(0.2f, 1.2e-3f, 1e6, 0.02f, 2e-4f, 1.f);
+	// The hair shape
+	yscn::shape *hair;
 
 	// make curve
 	if (ncurve) {
+		// create bvh
+		yu::logging::log_info("Creating first bvh");
+		yscn::build_bvh(scn);
+
 		for (auto ist : scn->instances) {
 			// hack skip by using name
 			if ( (ist->shp->name) != "" && (ist->shp->name)  == "floor") continue;
 			if (ist->shp->triangles.empty()) continue;
 			// TODO
-			auto acc_vector = ist->xform() * ym::vec4f{ 0.f, 9.8f, 0.f, 0.f };
-			auto hair = make_curves(ist->shp, ncurve, 8, hair_m, acc_vector.xyz());
-
+			if (natural_hair) {
+				auto acc_vector = ist->xform() * ym::vec4f{ 0.f, -9.8f, 0.f, 0.f };
+				hair = make_curves(scn, ist->shp, ncurve, 10, hair_m, acc_vector.xyz());
+			}
+			else {
+				hair = make_curves_simple(ist->shp, ncurve, 8, 0.001f);
+			}
 			hair->name = ist->shp->name + "_curve";
 			hair->mat = new yscn::material();
-			// TODO
-			hair->mat->op = 0.5f;
+			hair->mat->comb_txt = ist->shp->mat->comb_txt;
+			hair->mat->density_txt = ist->shp->mat->density_txt;
+			hair->mat->op = 0.3f;
 			hair->mat->kd = ist->shp->mat->kd;
 			hair->mat->kd_txt = ist->shp->mat->kd_txt;
 			auto hist = new yscn::instance();
@@ -913,14 +1339,14 @@ int main(int argc, char** argv) {
 		}
 	}
 
-
 	for (auto i : add_later) {
 		scn->instances.push_back(i);
 	}
 
 	// create bvh
-	yu::logging::log_info("creating bvh");
+	yu::logging::log_info("re creating bvh");
 	yscn::build_bvh(scn);
+
 
 	// raytrace
 	yu::logging::log_info("tracing scene");
